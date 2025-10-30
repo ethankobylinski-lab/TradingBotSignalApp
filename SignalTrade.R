@@ -50,13 +50,13 @@ source(file.path("data", "macro.R"))
 load_symbol_universe <- function() {
   tryCatch({
     sym <- quantmod::stockSymbols()
-    data.frame(
+    df <- data.frame(
       Symbol = toupper(sym$Symbol),
       Name   = as.character(sym$Name),
       stringsAsFactors = FALSE
     )
   }, error = function(e) {
-    data.frame(
+    df <- data.frame(
       Symbol = c("AAPL","MSFT","NVDA","AMZN","GOOGL","META","JPM","XOM","PG","JNJ","V","TSLA","BRK-B","COST","PEP","KO","UNH","HD","VZ","CRM","ETN","HON","CAT","DE","WMT","MCD"),
       Name   = c("Apple Inc.","Microsoft Corporation","NVIDIA Corporation","Amazon.com, Inc.","Alphabet Inc.",
                  "Meta Platforms, Inc.","JPMorgan Chase & Co.","Exxon Mobil Corporation","Procter & Gamble Company",
@@ -67,6 +67,9 @@ load_symbol_universe <- function() {
       stringsAsFactors = FALSE
     )
   })
+  df <- subset(df, !Symbol %in% get_ey_audit_exclusions())
+  rownames(df) <- NULL
+  df
 }
 SYMS <- load_symbol_universe()
 
@@ -113,52 +116,6 @@ ann_vol <- function(r_xts) sd(r_xts, na.rm=TRUE) * sqrt(252)
 sharpe  <- function(r_xts, rf_annual) {
   rf_daily <- log1p(rf_annual)/252
   (mean(r_xts, na.rm=TRUE) - rf_daily) / sd(r_xts, na.rm=TRUE) * sqrt(252)
-}
-
-# ---------- Weights / engine ----------
-calc_weights <- function(mode, hist_prices, vol_look=60, mom_look=252, weights0=NULL) {
-  N <- NCOL(hist_prices)
-  if (N == 0) return(numeric(0))
-  if (mode == "equal") {
-    rep(1/N, N)
-  } else if (mode == "riskparity") {
-    rets <- na.omit(diff(log(tail(hist_prices, vol_look + 1))))
-    vols <- apply(rets, 2, sd, na.rm=TRUE)
-    vols[!is.finite(vols)] <- median(vols[is.finite(vols)], na.rm=TRUE)
-    invv <- 1/pmax(vols, .Machine$double.eps); invv / sum(invv)
-  } else if (mode == "momentum") {
-    look <- min(mom_look, max(NROW(hist_prices)-1, 1))
-    pr <- tail(hist_prices, look + 1)
-    mom <- as.numeric(pr[NROW(pr), ]) / as.numeric(pr[1, ]) - 1
-    mom[!is.finite(mom) | mom < 0] <- 0
-    if (sum(mom) == 0) rep(1/N, N) else mom / sum(mom)
-  } else {
-    weights0
-  }
-}
-
-build_port <- function(prices, rebal_freq, weight_mode, vol_look, mom_look, weights0) {
-  log_rets <- na.omit(diff(log(prices)))
-  if (NCOL(log_rets) == 0) return(list(r_xts=xts(), last_w=weights0))
-  
-  if (rebal_freq == "none") {
-    w <- calc_weights(weight_mode, prices, vol_look, mom_look, weights0)
-    w <- if (is.null(w)) rep(1/NCOL(prices), NCOL(prices)) else w
-    port_ret <- xts(as.matrix(log_rets) %*% matrix(w, ncol=1), order.by=index(log_rets))
-    list(r_xts=port_ret, last_w=w)
-  } else {
-    eps <- switch(rebal_freq, "months"=endpoints(log_rets,"months"), "quarters"=endpoints(log_rets,"quarters"))
-    r_vec <- rep(NA_real_, NROW(log_rets)); last_w <- NULL
-    for (i in seq_along(eps[-1])) {
-      si <- eps[i]+1; ei <- eps[i+1]
-      w <- calc_weights(weight_mode, prices[1:ei,], vol_look, mom_look, weights0)
-      w <- if (is.null(w)) rep(1/NCOL(prices), NCOL(prices)) else w
-      r_vec[si:ei] <- as.matrix(log_rets[si:ei,]) %*% matrix(w, ncol=1)
-      last_w <- w
-    }
-    port_ret <- xts(r_vec, order.by=index(log_rets)); port_ret <- na.omit(port_ret)
-    list(r_xts=port_ret, last_w=last_w)
-  }
 }
 
 make_plots <- function(r_xts, conf) {
@@ -442,6 +399,14 @@ server <- function(input, output, session) {
       fixed <- corrected
     }
     fixed <- unique(fixed)
+    compliance <- filter_ey_compliant_tickers(fixed)
+    if (length(compliance$excluded)) {
+      showNotification(
+        paste("Removed EY-audit restricted tickers:", paste(compliance$excluded, collapse = ", ")),
+        type = "warning", duration = 6
+      )
+    }
+    fixed <- compliance$allowed
     if (!identical(sort(fixed), sort(input$tickers))) {
       updateSelectizeInput(session, "tickers", choices = symbol_choices, selected = fixed, server = TRUE)
       if (length(bad) == 0 && !identical(input$tickers, fixed)) {
@@ -491,6 +456,16 @@ server <- function(input, output, session) {
       need(!is.null(input$dates[1]) && !is.null(input$dates[2]), "Please choose a valid date range.")
     )
     
+    compliance <- filter_ey_compliant_tickers(input$tickers)
+    if (length(compliance$excluded)) {
+      showNotification(
+        paste("Excluded EY-audit restricted tickers:", paste(compliance$excluded, collapse = ", ")), 
+        type = "warning", duration = 6
+      )
+    }
+    tickers_use <- compliance$allowed
+    validate(need(length(tickers_use) >= 2, "Candidate universe is empty after compliance filters."))
+
     weights0 <- NULL
     if (input$mode == "fixed") {
       validate(need(nchar(input$weights) > 0, "Enter weights (comma-separated) for fixed mode."))
@@ -499,7 +474,10 @@ server <- function(input, output, session) {
         need(length(w) == length(input$tickers), "Number of weights must match number of tickers."),
         need(abs(sum(w) - 1) < 1e-6, "Weights must sum to 1.")
       )
-      weights0 <- w
+      named_w <- setNames(w, toupper(input$tickers))
+      named_w <- named_w[tickers_use]
+      validate(need(length(named_w) == length(tickers_use), "Weights missing for allowed tickers after exclusions."))
+      weights0 <- as.numeric(named_w / sum(named_w))
     }
     
     withProgress(message="Fetching prices…", value=0.2, {
