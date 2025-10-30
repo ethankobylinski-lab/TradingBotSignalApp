@@ -1,3 +1,27 @@
+if (file.exists("R/config_helpers.R")) {
+  source("R/config_helpers.R")
+} else {
+  stop("Missing configuration helper at R/config_helpers.R")
+}
+
+default_config <- list(
+  experiments = list(base_path = "experiments", auto_log = FALSE, redact_inputs = FALSE),
+  versioning  = list(enabled = FALSE, snapshot_prefix = "snapshot", hash_algo = "sha256"),
+  data_quality = list(enabled = FALSE),
+  data = list(versions_path = "data/versions")
+)
+
+APP_CONFIG <- tryCatch({
+  cfg <- load_app_config()
+  config_path <- attr(cfg, "config_path")
+  merged <- modifyList(default_config, cfg)
+  if (!is.null(config_path)) attr(merged, "config_path") <- config_path
+  merged
+}, error = function(e) {
+  warning(e$message)
+  default_config
+})
+
 suppressPackageStartupMessages({
   library(shiny)
   library(bslib)
