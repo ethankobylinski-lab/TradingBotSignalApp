@@ -10,17 +10,19 @@ suppressPackageStartupMessages({
   library(zoo)
 })
 
+source("R/portfolio/optimizer.R")
+
 # --- Symbol universe for search & correction ---
 load_symbol_universe <- function() {
   tryCatch({
     sym <- quantmod::stockSymbols()
-    data.frame(
+    df <- data.frame(
       Symbol = toupper(sym$Symbol),
       Name   = as.character(sym$Name),
       stringsAsFactors = FALSE
     )
   }, error = function(e) {
-    data.frame(
+    df <- data.frame(
       Symbol = c("AAPL","MSFT","NVDA","AMZN","GOOGL","META","JPM","XOM","PG","JNJ","V","TSLA","BRK-B","COST","PEP","KO","UNH","HD","VZ","CRM","ETN","HON","CAT","DE","WMT","MCD"),
       Name   = c("Apple Inc.","Microsoft Corporation","NVIDIA Corporation","Amazon.com, Inc.","Alphabet Inc.",
                  "Meta Platforms, Inc.","JPMorgan Chase & Co.","Exxon Mobil Corporation","Procter & Gamble Company",
@@ -31,6 +33,9 @@ load_symbol_universe <- function() {
       stringsAsFactors = FALSE
     )
   })
+  df <- subset(df, !Symbol %in% get_ey_audit_exclusions())
+  rownames(df) <- NULL
+  df
 }
 SYMS <- load_symbol_universe()
 
@@ -77,52 +82,6 @@ ann_vol <- function(r_xts) sd(r_xts, na.rm=TRUE) * sqrt(252)
 sharpe  <- function(r_xts, rf_annual) {
   rf_daily <- log1p(rf_annual)/252
   (mean(r_xts, na.rm=TRUE) - rf_daily) / sd(r_xts, na.rm=TRUE) * sqrt(252)
-}
-
-# ---------- Weights / engine ----------
-calc_weights <- function(mode, hist_prices, vol_look=60, mom_look=252, weights0=NULL) {
-  N <- NCOL(hist_prices)
-  if (N == 0) return(numeric(0))
-  if (mode == "equal") {
-    rep(1/N, N)
-  } else if (mode == "riskparity") {
-    rets <- na.omit(diff(log(tail(hist_prices, vol_look + 1))))
-    vols <- apply(rets, 2, sd, na.rm=TRUE)
-    vols[!is.finite(vols)] <- median(vols[is.finite(vols)], na.rm=TRUE)
-    invv <- 1/pmax(vols, .Machine$double.eps); invv / sum(invv)
-  } else if (mode == "momentum") {
-    look <- min(mom_look, max(NROW(hist_prices)-1, 1))
-    pr <- tail(hist_prices, look + 1)
-    mom <- as.numeric(pr[NROW(pr), ]) / as.numeric(pr[1, ]) - 1
-    mom[!is.finite(mom) | mom < 0] <- 0
-    if (sum(mom) == 0) rep(1/N, N) else mom / sum(mom)
-  } else {
-    weights0
-  }
-}
-
-build_port <- function(prices, rebal_freq, weight_mode, vol_look, mom_look, weights0) {
-  log_rets <- na.omit(diff(log(prices)))
-  if (NCOL(log_rets) == 0) return(list(r_xts=xts(), last_w=weights0))
-  
-  if (rebal_freq == "none") {
-    w <- calc_weights(weight_mode, prices, vol_look, mom_look, weights0)
-    w <- if (is.null(w)) rep(1/NCOL(prices), NCOL(prices)) else w
-    port_ret <- xts(as.matrix(log_rets) %*% matrix(w, ncol=1), order.by=index(log_rets))
-    list(r_xts=port_ret, last_w=w)
-  } else {
-    eps <- switch(rebal_freq, "months"=endpoints(log_rets,"months"), "quarters"=endpoints(log_rets,"quarters"))
-    r_vec <- rep(NA_real_, NROW(log_rets)); last_w <- NULL
-    for (i in seq_along(eps[-1])) {
-      si <- eps[i]+1; ei <- eps[i+1]
-      w <- calc_weights(weight_mode, prices[1:ei,], vol_look, mom_look, weights0)
-      w <- if (is.null(w)) rep(1/NCOL(prices), NCOL(prices)) else w
-      r_vec[si:ei] <- as.matrix(log_rets[si:ei,]) %*% matrix(w, ncol=1)
-      last_w <- w
-    }
-    port_ret <- xts(r_vec, order.by=index(log_rets)); port_ret <- na.omit(port_ret)
-    list(r_xts=port_ret, last_w=last_w)
-  }
 }
 
 make_plots <- function(r_xts, conf) {
@@ -290,6 +249,18 @@ ui <- page_navbar(
                 )
               ),
               card(
+                card_header("Optimization Snapshot"),
+                fluidRow(
+                  column(4, uiOutput("opt_metrics")),
+                  column(4, DTOutput("weights_tbl")),
+                  column(4, uiOutput("compliance_ui"))
+                )
+              ),
+              card(
+                card_header("Stress Tests"),
+                DTOutput("stress_tbl")
+              ),
+              card(
                 card_header("Distributions & Risk Over Time"),
                 fluidRow(
                   column(6, plotOutput("p_hist", height = 300)),
@@ -337,6 +308,14 @@ server <- function(input, output, session) {
       fixed <- corrected
     }
     fixed <- unique(fixed)
+    compliance <- filter_ey_compliant_tickers(fixed)
+    if (length(compliance$excluded)) {
+      showNotification(
+        paste("Removed EY-audit restricted tickers:", paste(compliance$excluded, collapse = ", ")),
+        type = "warning", duration = 6
+      )
+    }
+    fixed <- compliance$allowed
     if (!identical(sort(fixed), sort(input$tickers))) {
       updateSelectizeInput(session, "tickers", choices = symbol_choices, selected = fixed, server = TRUE)
       if (length(bad) == 0 && !identical(input$tickers, fixed)) {
@@ -386,6 +365,16 @@ server <- function(input, output, session) {
       need(!is.null(input$dates[1]) && !is.null(input$dates[2]), "Please choose a valid date range.")
     )
     
+    compliance <- filter_ey_compliant_tickers(input$tickers)
+    if (length(compliance$excluded)) {
+      showNotification(
+        paste("Excluded EY-audit restricted tickers:", paste(compliance$excluded, collapse = ", ")), 
+        type = "warning", duration = 6
+      )
+    }
+    tickers_use <- compliance$allowed
+    validate(need(length(tickers_use) >= 2, "Candidate universe is empty after compliance filters."))
+
     weights0 <- NULL
     if (input$mode == "fixed") {
       validate(need(nchar(input$weights) > 0, "Enter weights (comma-separated) for fixed mode."))
@@ -394,12 +383,15 @@ server <- function(input, output, session) {
         need(length(w) == length(input$tickers), "Number of weights must match number of tickers."),
         need(abs(sum(w) - 1) < 1e-6, "Weights must sum to 1.")
       )
-      weights0 <- w
+      named_w <- setNames(w, toupper(input$tickers))
+      named_w <- named_w[tickers_use]
+      validate(need(length(named_w) == length(tickers_use), "Weights missing for allowed tickers after exclusions."))
+      weights0 <- as.numeric(named_w / sum(named_w))
     }
     
     withProgress(message="Fetching prices…", value=0.2, {
       # Robust per-symbol fetch (handles hyphens without relying on auto-assigned objects)
-      prices_list <- lapply(input$tickers, function(t) {
+      prices_list <- lapply(tickers_use, function(t) {
         xt <- tryCatch({
           suppressWarnings(
             quantmod::getSymbols(t, from=input$dates[1], to=input$dates[2], auto.assign=FALSE, warnings=FALSE)
@@ -411,7 +403,7 @@ server <- function(input, output, session) {
       ok <- !vapply(prices_list, is.null, logical(1))
       validate(need(any(ok), "Download failed for all symbols. Try a different range or remove delisted tickers."))
       prices_list <- prices_list[ok]
-      tick_ok <- input$tickers[ok]
+      tick_ok <- tickers_use[ok]
       prices <- do.call(merge, prices_list)
       colnames(prices) <- tick_ok
       
@@ -420,11 +412,12 @@ server <- function(input, output, session) {
       validate(need(NROW(prices) > 260, "Not enough data; try a longer window."))
       
       incProgress(0.3, detail="Building portfolio…")
-      built <- build_port(prices, input$rebal, input$mode, 60, 252, weights0)
-      r_xts <- built$r_xts
+      params <- list(vol_look = 60, mom_look = 252)
+      opt_res <- optimize_portfolio(prices, input$mode, input$rebal, params, weights0)
+      r_xts <- opt_res$r_xts
       validate(need(NROW(r_xts) > 0, "No returns computed; check your inputs."))
       r <- as.numeric(r_xts)
-      last_w <- if (is.null(built$last_w)) (rep(1/NCOL(prices), NCOL(prices))) else built$last_w
+      last_w <- if (is.null(opt_res$last_w)) (rep(1/NCOL(prices), NCOL(prices))) else opt_res$last_w
       
       incProgress(0.2, detail="Computing risk metrics…")
       VaR_hist  <- hist_VaR(r, input$conf)
@@ -461,15 +454,75 @@ server <- function(input, output, session) {
         stringsAsFactors = FALSE
       )
       rownames(stats) <- stats$Metric
-      
-      list(prices=prices, r_xts=r_xts, risk_tbl=risk_tbl, stats=stats, plots=plots, last_w=last_w)
+
+      weights_named <- setNames(last_w, colnames(prices))
+      stress_tbl <- simulate_event_impact(
+        prices,
+        weights_named,
+        focus_ticker = tickers_use[1],
+        peer_ticker = if (length(tickers_use) >= 2) tail(tickers_use, 1) else tickers_use[1]
+      )
+
+      list(
+        prices = prices,
+        r_xts = r_xts,
+        risk_tbl = risk_tbl,
+        stats = stats,
+        plots = plots,
+        last_w = last_w,
+        optimizer = list(
+          expected_return = opt_res$expected_annual_return,
+          expected_vol = opt_res$expected_annual_vol,
+          expected_sharpe = opt_res$expected_sharpe,
+          weights = opt_res$asset_expected
+        ),
+        compliance = list(excluded = compliance$excluded, universe = tickers_use),
+        stress = stress_tbl
+      )
     })
   }, ignoreInit = TRUE)
   
   # Tables
   output$risk_tbl <- renderDT({ req(results()); datatable(results()$risk_tbl, rownames=FALSE, options=list(pageLength=5)) })
   output$stats_tbl <- renderDT({ req(results()); datatable(results()$stats, rownames=FALSE, options=list(dom='t')) })
-  
+  output$weights_tbl <- renderDT({
+    req(results())
+    opt <- results()$optimizer
+    validate(need(!is.null(opt$weights), "Run the optimizer to view weights."))
+    datatable(opt$weights, rownames = FALSE, options = list(dom = 't', pageLength = 8))
+  })
+  output$opt_metrics <- renderUI({
+    req(results())
+    opt <- results()$optimizer
+    if (is.null(opt)) return(NULL)
+    fmt <- function(x) if (is.na(x)) "—" else sprintf("%0.2f%%", x * 100)
+    tags$div(
+      tags$p(tags$strong("Expected annual return"), fmt(opt$expected_return)),
+      tags$p(tags$strong("Expected annual volatility"), fmt(opt$expected_vol)),
+      tags$p(tags$strong("Expected Sharpe"), if (is.na(opt$expected_sharpe)) "—" else sprintf("%0.2f", opt$expected_sharpe))
+    )
+  })
+  output$compliance_ui <- renderUI({
+    req(results())
+    cmp <- results()$compliance
+    if (is.null(cmp)) return(NULL)
+    msgs <- list(
+      tags$p(tags$strong("Universe"), paste(cmp$universe, collapse = ", "))
+    )
+    if (length(cmp$excluded)) {
+      msgs <- c(msgs, list(tags$p(tags$strong("Restricted"), paste(cmp$excluded, collapse = ", ")), tags$p("Excluded per EY audit policy.")))
+    } else {
+      msgs <- c(msgs, list(tags$p("No EY audit exclusions triggered.")))
+    }
+    do.call(tags$div, msgs)
+  })
+  output$stress_tbl <- renderDT({
+    req(results())
+    st <- results()$stress
+    if (is.null(st) || !NROW(st)) return(NULL)
+    datatable(st, rownames = FALSE, options = list(dom = 't', pageLength = 5))
+  })
+
   # Plots
   output$p_hist <- renderPlot({ req(results()); results()$plots$p_hist })
   output$p_roll <- renderPlot({ req(results()); results()$plots$p_roll })
