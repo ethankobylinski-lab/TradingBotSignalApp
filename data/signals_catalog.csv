@@ -1,0 +1,6 @@
+signal_name,source,lag,refresh_cadence,ey_exclusion
+momentum_252d,price,1,Daily,FALSE
+volatility_60d,price,1,Daily,FALSE
+pe_snapshot,fundamentals,1,Daily,TRUE
+news_sentiment_1d,news,0,Hourly,TRUE
+macro_trend_10y,macro,1,Daily,FALSE
