@@ -1,0 +1,40 @@
+api:
+  yahoo_finance:
+    base_url: "https://query1.finance.yahoo.com"
+    key: "YOUR_YAHOO_API_KEY"
+  analytics_platform:
+    endpoint: "https://internal-analytics.example.com"
+    token: "YOUR_ANALYTICS_TOKEN"
+data:
+  raw_path: "data/raw"
+  processed_path: "data/processed"
+  cache_path: "data/cache"
+  versions_path: "data/versions"
+refresh:
+  price_data_cron: "0 */6 * * *"
+  compliance_report_cron: "0 6 * * 1"
+  experiment_cleanup_days: 30
+compliance:
+  enforce_pii_scrub: true
+  enable_audit_logging: true
+  retention_days: 365
+  export_controls:
+    allow_us_only: true
+    restrict_high_risk_regions: true
+experiments:
+  base_path: "experiments"
+  auto_log: true
+  redact_inputs: false
+versioning:
+  enabled: true
+  snapshot_prefix: "portfolio_snapshot"
+  hash_algo: "sha256"
+data_quality:
+  enabled: true
+  max_missing_pct: 0.02
+  max_duplicate_timestamps: 0
+  min_observations: 252
+  warn_if_zero_returns: true
+reporting:
+  rmarkdown_template: "reports/weekly_overview.Rmd"
+  schedule: "0 9 * * MON"

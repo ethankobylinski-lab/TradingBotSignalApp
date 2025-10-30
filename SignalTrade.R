@@ -1,3 +1,27 @@
+if (file.exists("R/config_helpers.R")) {
+  source("R/config_helpers.R")
+} else {
+  stop("Missing configuration helper at R/config_helpers.R")
+}
+
+default_config <- list(
+  experiments = list(base_path = "experiments", auto_log = FALSE, redact_inputs = FALSE),
+  versioning  = list(enabled = FALSE, snapshot_prefix = "snapshot", hash_algo = "sha256"),
+  data_quality = list(enabled = FALSE),
+  data = list(versions_path = "data/versions")
+)
+
+APP_CONFIG <- tryCatch({
+  cfg <- load_app_config()
+  config_path <- attr(cfg, "config_path")
+  merged <- modifyList(default_config, cfg)
+  if (!is.null(config_path)) attr(merged, "config_path") <- config_path
+  merged
+}, error = function(e) {
+  warning(e$message)
+  default_config
+})
+
 suppressPackageStartupMessages({
   library(shiny)
   library(bslib)
@@ -9,6 +33,129 @@ suppressPackageStartupMessages({
   library(grid)
   library(zoo)
 })
+
+ensure_namespace <- function(pkg, fatal = TRUE) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    msg <- sprintf("Package '%s' is required for this operation.", pkg)
+    if (fatal) {
+      stop(msg, call. = FALSE)
+    } else {
+      warning(msg, call. = FALSE)
+      return(FALSE)
+    }
+  }
+  TRUE
+}
+
+run_data_quality_checks <- function(prices, cfg = APP_CONFIG$data_quality) {
+  if (is.null(cfg) || isFALSE(cfg$enabled)) {
+    return(list(enabled = FALSE, ok = TRUE, issues = character(0), summary = list()))
+  }
+
+  if (!xts::is.xts(prices)) {
+    stop("Data-quality checks expect an xts object of prices.", call. = FALSE)
+  }
+
+  total_obs <- NROW(prices)
+  missing_count <- sum(is.na(prices))
+  missing_pct <- if (total_obs > 0) missing_count / (total_obs * NCOL(prices)) else 0
+  issues <- character(0)
+
+  if (!is.null(cfg$min_observations) && total_obs < cfg$min_observations) {
+    issues <- c(issues, sprintf("Only %d observations (min required %d).", total_obs, cfg$min_observations))
+  }
+
+  if (!is.null(cfg$max_missing_pct) && missing_pct > cfg$max_missing_pct) {
+    issues <- c(issues, sprintf("Missing value ratio %.2f%% exceeds %.2f%% threshold.", missing_pct * 100, cfg$max_missing_pct * 100))
+  }
+
+  duplicate_count <- sum(duplicated(index(prices)))
+  if (!is.null(cfg$max_duplicate_timestamps) && duplicate_count > cfg$max_duplicate_timestamps) {
+    issues <- c(issues, sprintf("Detected %d duplicate timestamps.", duplicate_count))
+  }
+
+  zero_return_cols <- character(0)
+  if (isTRUE(cfg$warn_if_zero_returns) && total_obs > 1) {
+    price_diff <- diff(prices)
+    if (NCOL(price_diff) > 0) {
+      zero_return_cols <- colnames(price_diff)[apply(coredata(price_diff), 2, function(col) all(na.omit(as.numeric(col)) == 0))]
+      if (length(zero_return_cols)) {
+        issues <- c(issues, sprintf("Columns with zero change: %s", paste(zero_return_cols, collapse = ", ")))
+      }
+    }
+  }
+
+  coverage <- if (total_obs > 0) colMeans(!is.na(prices)) else rep(0, NCOL(prices))
+
+  list(
+    enabled = TRUE,
+    ok = length(issues) == 0,
+    issues = issues,
+    summary = list(
+      observations = total_obs,
+      missing_pct = missing_pct,
+      duplicate_timestamps = duplicate_count,
+      zero_return_columns = zero_return_cols,
+      coverage = coverage
+    )
+  )
+}
+
+record_data_version <- function(prices, metadata = list(), config = APP_CONFIG) {
+  version_cfg <- config$versioning
+  if (is.null(version_cfg) || isFALSE(version_cfg$enabled)) {
+    return(list(enabled = FALSE))
+  }
+
+  if (!ensure_namespace("digest", fatal = FALSE)) {
+    return(list(enabled = FALSE, reason = "digest_missing"))
+  }
+
+  base_dir <- version_cfg$path %||% config$data$versions_path %||% "data/versions"
+  dir.create(base_dir, recursive = TRUE, showWarnings = FALSE)
+
+  stamp <- format(Sys.time(), "%Y%m%d-%H%M%S")
+  hash_algo <- version_cfg$hash_algo %||% "sha256"
+  hash <- digest::digest(list(prices = prices, metadata = metadata), algo = hash_algo)
+  file_name <- sprintf("%s_%s_%s.rds", version_cfg$snapshot_prefix %||% "snapshot", stamp, substr(hash, 1, 12))
+  file_path <- file.path(base_dir, file_name)
+
+  saveRDS(list(prices = prices, metadata = metadata, hash = hash, created = Sys.time()), file_path)
+
+  list(enabled = TRUE, hash = hash, file = file_path, timestamp = stamp, algo = hash_algo)
+}
+
+log_experiment <- function(result, metadata = list(), config = APP_CONFIG) {
+  ensure_namespace("yaml")
+
+  exp_cfg <- config$experiments %||% list(base_path = "experiments", auto_log = FALSE, redact_inputs = FALSE)
+  base_path <- exp_cfg$base_path %||% "experiments"
+  dir.create(base_path, recursive = TRUE, showWarnings = FALSE)
+
+  run_id <- format(Sys.time(), "%Y%m%d-%H%M%S")
+  if (!is.null(metadata$run_id)) {
+    run_id <- sprintf("%s-%s", run_id, metadata$run_id)
+    metadata$run_id <- NULL
+  }
+  run_dir <- file.path(base_path, run_id)
+  dir.create(run_dir, recursive = TRUE, showWarnings = FALSE)
+
+  if (isTRUE(exp_cfg$redact_inputs) && !is.null(metadata$inputs)) {
+    metadata$inputs <- "[REDACTED]"
+  }
+
+  config_path <- attr(config, "config_path") %||% NA_character_
+  meta_payload <- list(
+    timestamp = format(Sys.time(), tz = "UTC", usetz = TRUE),
+    config_path = config_path,
+    metadata = metadata
+  )
+
+  yaml::write_yaml(meta_payload, file.path(run_dir, "metadata.yml"))
+  saveRDS(result, file.path(run_dir, "result.rds"))
+
+  invisible(run_dir)
+}
 
 # --- Symbol universe for search & correction ---
 load_symbol_universe <- function() {
@@ -418,6 +565,11 @@ server <- function(input, output, session) {
       prices <- na.locf(prices, na.rm=FALSE)
       prices <- prices[complete.cases(prices), ]
       validate(need(NROW(prices) > 260, "Not enough data; try a longer window."))
+
+      dq_summary <- run_data_quality_checks(prices)
+      if (isTRUE(dq_summary$enabled) && !isTRUE(dq_summary$ok)) {
+        showNotification(paste(dq_summary$issues, collapse = "; "), type = "warning", duration = 10)
+      }
       
       incProgress(0.3, detail="Building portfolio…")
       built <- build_port(prices, input$rebal, input$mode, 60, 252, weights0)
@@ -462,7 +614,45 @@ server <- function(input, output, session) {
       )
       rownames(stats) <- stats$Metric
       
-      list(prices=prices, r_xts=r_xts, risk_tbl=risk_tbl, stats=stats, plots=plots, last_w=last_w)
+      version_info <- record_data_version(
+        prices,
+        metadata = list(
+          tickers = tick_ok,
+          start = as.character(start(prices)),
+          end = as.character(end(prices)),
+          rebal = input$rebal,
+          mode = input$mode
+        )
+      )
+
+      result_payload <- list(
+        prices=prices,
+        r_xts=r_xts,
+        risk_tbl=risk_tbl,
+        stats=stats,
+        plots=plots,
+        last_w=last_w,
+        data_quality=dq_summary,
+        version=version_info
+      )
+
+      if (isTRUE(APP_CONFIG$experiments$auto_log)) {
+        metadata <- list(
+          inputs = list(
+            tickers = tick_ok,
+            dates = as.character(input$dates),
+            mode = input$mode,
+            rebal = input$rebal,
+            conf = input$conf,
+            notional = input$notional
+          ),
+          data_quality = dq_summary,
+          version = version_info
+        )
+        try(log_experiment(result_payload, metadata), silent = TRUE)
+      }
+
+      result_payload
     })
   }, ignoreInit = TRUE)
   
