@@ -1,3 +1,27 @@
+if (file.exists("R/config_helpers.R")) {
+  source("R/config_helpers.R")
+} else {
+  stop("Missing configuration helper at R/config_helpers.R")
+}
+
+default_config <- list(
+  experiments = list(base_path = "experiments", auto_log = FALSE, redact_inputs = FALSE),
+  versioning  = list(enabled = FALSE, snapshot_prefix = "snapshot", hash_algo = "sha256"),
+  data_quality = list(enabled = FALSE),
+  data = list(versions_path = "data/versions")
+)
+
+APP_CONFIG <- tryCatch({
+  cfg <- load_app_config()
+  config_path <- attr(cfg, "config_path")
+  merged <- modifyList(default_config, cfg)
+  if (!is.null(config_path)) attr(merged, "config_path") <- config_path
+  merged
+}, error = function(e) {
+  warning(e$message)
+  default_config
+})
+
 suppressPackageStartupMessages({
   library(shiny)
   library(bslib)
@@ -8,19 +32,31 @@ suppressPackageStartupMessages({
   library(gridExtra)
   library(grid)
   library(zoo)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(xml2)
+  library(stringr)
 })
+
+source(file.path("data", "cache.R"))
+source(file.path("data", "price_loader.R"))
+source(file.path("data", "fundamentals.R"))
+source(file.path("data", "news.R"))
+source(file.path("data", "macro.R"))
 
 # --- Symbol universe for search & correction ---
 load_symbol_universe <- function() {
   tryCatch({
     sym <- quantmod::stockSymbols()
-    data.frame(
+    df <- data.frame(
       Symbol = toupper(sym$Symbol),
       Name   = as.character(sym$Name),
       stringsAsFactors = FALSE
     )
   }, error = function(e) {
-    data.frame(
+    df <- data.frame(
       Symbol = c("AAPL","MSFT","NVDA","AMZN","GOOGL","META","JPM","XOM","PG","JNJ","V","TSLA","BRK-B","COST","PEP","KO","UNH","HD","VZ","CRM","ETN","HON","CAT","DE","WMT","MCD"),
       Name   = c("Apple Inc.","Microsoft Corporation","NVIDIA Corporation","Amazon.com, Inc.","Alphabet Inc.",
                  "Meta Platforms, Inc.","JPMorgan Chase & Co.","Exxon Mobil Corporation","Procter & Gamble Company",
@@ -31,6 +67,9 @@ load_symbol_universe <- function() {
       stringsAsFactors = FALSE
     )
   })
+  df <- subset(df, !Symbol %in% get_ey_audit_exclusions())
+  rownames(df) <- NULL
+  df
 }
 SYMS <- load_symbol_universe()
 
@@ -77,52 +116,6 @@ ann_vol <- function(r_xts) sd(r_xts, na.rm=TRUE) * sqrt(252)
 sharpe  <- function(r_xts, rf_annual) {
   rf_daily <- log1p(rf_annual)/252
   (mean(r_xts, na.rm=TRUE) - rf_daily) / sd(r_xts, na.rm=TRUE) * sqrt(252)
-}
-
-# ---------- Weights / engine ----------
-calc_weights <- function(mode, hist_prices, vol_look=60, mom_look=252, weights0=NULL) {
-  N <- NCOL(hist_prices)
-  if (N == 0) return(numeric(0))
-  if (mode == "equal") {
-    rep(1/N, N)
-  } else if (mode == "riskparity") {
-    rets <- na.omit(diff(log(tail(hist_prices, vol_look + 1))))
-    vols <- apply(rets, 2, sd, na.rm=TRUE)
-    vols[!is.finite(vols)] <- median(vols[is.finite(vols)], na.rm=TRUE)
-    invv <- 1/pmax(vols, .Machine$double.eps); invv / sum(invv)
-  } else if (mode == "momentum") {
-    look <- min(mom_look, max(NROW(hist_prices)-1, 1))
-    pr <- tail(hist_prices, look + 1)
-    mom <- as.numeric(pr[NROW(pr), ]) / as.numeric(pr[1, ]) - 1
-    mom[!is.finite(mom) | mom < 0] <- 0
-    if (sum(mom) == 0) rep(1/N, N) else mom / sum(mom)
-  } else {
-    weights0
-  }
-}
-
-build_port <- function(prices, rebal_freq, weight_mode, vol_look, mom_look, weights0) {
-  log_rets <- na.omit(diff(log(prices)))
-  if (NCOL(log_rets) == 0) return(list(r_xts=xts(), last_w=weights0))
-  
-  if (rebal_freq == "none") {
-    w <- calc_weights(weight_mode, prices, vol_look, mom_look, weights0)
-    w <- if (is.null(w)) rep(1/NCOL(prices), NCOL(prices)) else w
-    port_ret <- xts(as.matrix(log_rets) %*% matrix(w, ncol=1), order.by=index(log_rets))
-    list(r_xts=port_ret, last_w=w)
-  } else {
-    eps <- switch(rebal_freq, "months"=endpoints(log_rets,"months"), "quarters"=endpoints(log_rets,"quarters"))
-    r_vec <- rep(NA_real_, NROW(log_rets)); last_w <- NULL
-    for (i in seq_along(eps[-1])) {
-      si <- eps[i]+1; ei <- eps[i+1]
-      w <- calc_weights(weight_mode, prices[1:ei,], vol_look, mom_look, weights0)
-      w <- if (is.null(w)) rep(1/NCOL(prices), NCOL(prices)) else w
-      r_vec[si:ei] <- as.matrix(log_rets[si:ei,]) %*% matrix(w, ncol=1)
-      last_w <- w
-    }
-    port_ret <- xts(r_vec, order.by=index(log_rets)); port_ret <- na.omit(port_ret)
-    list(r_xts=port_ret, last_w=last_w)
-  }
 }
 
 make_plots <- function(r_xts, conf) {
@@ -205,6 +198,71 @@ suggestions <- function(w, n, vol, var_pct, maxdd, mode) {
   if (abs(maxdd) > 0.35) s <- c(s, "Blend in lower-beta sectors to improve worst-case behavior.")
   if (length(s) == 0) s <- "Looks solid. Keep weights tidy and rebalance periodically."
   s
+}
+
+build_signal_table <- function(symbols, start_date, end_date,
+                               macro_series = c("DGS10", "DTWEXM")) {
+  price_tbl <- load_price_history(symbols, start_date, end_date)
+  if (nrow(price_tbl) == 0) {
+    return(tibble())
+  }
+
+  price_signals <- price_tbl %>%
+    group_by(symbol) %>%
+    arrange(date, .by_group = TRUE) %>%
+    mutate(
+      log_return = log(adjusted / dplyr::lag(adjusted)),
+      pct_change = adjusted / dplyr::lag(adjusted) - 1,
+      momentum_252d = adjusted / dplyr::lag(adjusted, 252) - 1
+    ) %>%
+    mutate(
+      volatility_60d = zoo::rollapplyr(log_return, width = 60, FUN = sd, fill = NA_real_) * sqrt(252)
+    ) %>%
+    ungroup()
+
+  fundamentals_snapshot <- load_fundamentals(symbols) %>%
+    arrange(symbol, desc(date)) %>%
+    group_by(symbol) %>%
+    slice_head(n = 1) %>%
+    ungroup() %>%
+    select(symbol, pe_ratio, eps, peg_ratio, book_value, dividend_yield, market_cap)
+
+  news_daily <- load_news(symbols, start_date, end_date) %>%
+    mutate(date = as.Date(date)) %>%
+    group_by(symbol, date) %>%
+    summarise(
+      news_headlines = paste(headline, collapse = " | "),
+      news_sentiment = mean(sentiment, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(news_sentiment = ifelse(is.nan(news_sentiment), NA_real_, news_sentiment))
+
+  macro_wide <- load_macro(macro_series, start_date, end_date) %>%
+    mutate(date = as.Date(date)) %>%
+    tidyr::pivot_wider(names_from = symbol, values_from = value)
+
+  signal_tbl <- price_signals %>%
+    left_join(news_daily, by = c("symbol", "date")) %>%
+    left_join(macro_wide, by = "date") %>%
+    arrange(symbol, date)
+
+  if (nrow(fundamentals_snapshot) > 0) {
+    signal_tbl <- signal_tbl %>%
+      left_join(fundamentals_snapshot, by = "symbol")
+  }
+
+  macro_cols <- setdiff(colnames(macro_wide), "date")
+  if (length(macro_cols)) {
+    signal_tbl <- signal_tbl %>%
+      arrange(date) %>%
+      tidyr::fill(dplyr::all_of(macro_cols), .direction = "down")
+  }
+
+  signal_tbl %>%
+    group_by(symbol) %>%
+    tidyr::fill(news_headlines, news_sentiment, pe_ratio, eps, peg_ratio, book_value,
+                dividend_yield, market_cap, .direction = "downup") %>%
+    ungroup()
 }
 
 # ---------- Presets ----------
@@ -290,6 +348,10 @@ ui <- page_navbar(
                 )
               ),
               card(
+                card_header("Unified Signals"),
+                DTOutput("signals_tbl")
+              ),
+              card(
                 card_header("Distributions & Risk Over Time"),
                 fluidRow(
                   column(6, plotOutput("p_hist", height = 300)),
@@ -337,6 +399,14 @@ server <- function(input, output, session) {
       fixed <- corrected
     }
     fixed <- unique(fixed)
+    compliance <- filter_ey_compliant_tickers(fixed)
+    if (length(compliance$excluded)) {
+      showNotification(
+        paste("Removed EY-audit restricted tickers:", paste(compliance$excluded, collapse = ", ")),
+        type = "warning", duration = 6
+      )
+    }
+    fixed <- compliance$allowed
     if (!identical(sort(fixed), sort(input$tickers))) {
       updateSelectizeInput(session, "tickers", choices = symbol_choices, selected = fixed, server = TRUE)
       if (length(bad) == 0 && !identical(input$tickers, fixed)) {
@@ -386,6 +456,16 @@ server <- function(input, output, session) {
       need(!is.null(input$dates[1]) && !is.null(input$dates[2]), "Please choose a valid date range.")
     )
     
+    compliance <- filter_ey_compliant_tickers(input$tickers)
+    if (length(compliance$excluded)) {
+      showNotification(
+        paste("Excluded EY-audit restricted tickers:", paste(compliance$excluded, collapse = ", ")), 
+        type = "warning", duration = 6
+      )
+    }
+    tickers_use <- compliance$allowed
+    validate(need(length(tickers_use) >= 2, "Candidate universe is empty after compliance filters."))
+
     weights0 <- NULL
     if (input$mode == "fixed") {
       validate(need(nchar(input$weights) > 0, "Enter weights (comma-separated) for fixed mode."))
@@ -394,39 +474,38 @@ server <- function(input, output, session) {
         need(length(w) == length(input$tickers), "Number of weights must match number of tickers."),
         need(abs(sum(w) - 1) < 1e-6, "Weights must sum to 1.")
       )
-      weights0 <- w
+      named_w <- setNames(w, toupper(input$tickers))
+      named_w <- named_w[tickers_use]
+      validate(need(length(named_w) == length(tickers_use), "Weights missing for allowed tickers after exclusions."))
+      weights0 <- as.numeric(named_w / sum(named_w))
     }
     
     withProgress(message="Fetching prices…", value=0.2, {
-      # Robust per-symbol fetch (handles hyphens without relying on auto-assigned objects)
-      prices_list <- lapply(input$tickers, function(t) {
-        xt <- tryCatch({
-          suppressWarnings(
-            quantmod::getSymbols(t, from=input$dates[1], to=input$dates[2], auto.assign=FALSE, warnings=FALSE)
-          )
-        }, error=function(e) NULL)
-        if (is.null(xt)) return(NULL)
-        Ad(xt)
-      })
-      ok <- !vapply(prices_list, is.null, logical(1))
-      validate(need(any(ok), "Download failed for all symbols. Try a different range or remove delisted tickers."))
-      prices_list <- prices_list[ok]
-      tick_ok <- input$tickers[ok]
-      prices <- do.call(merge, prices_list)
-      colnames(prices) <- tick_ok
-      
-      prices <- na.locf(prices, na.rm=FALSE)
-      prices <- prices[complete.cases(prices), ]
-      validate(need(NROW(prices) > 260, "Not enough data; try a longer window."))
-      
-      incProgress(0.3, detail="Building portfolio…")
+      price_tbl <- load_price_history(input$tickers, input$dates[1], input$dates[2])
+      validate(need(nrow(price_tbl) > 0, "Download failed for all symbols. Try a different range or remove delisted tickers."))
+
+      price_wide <- price_tbl %>%
+        tidyr::pivot_wider(names_from = symbol, values_from = adjusted) %>%
+        arrange(date)
+      validate(need(nrow(price_wide) > 0, "No price history available for the requested window."))
+
+      price_wide <- price_wide %>%
+        mutate(across(-date, ~zoo::na.locf(.x, na.rm = FALSE))) %>%
+        filter(complete.cases(.))
+
+      validate(need(nrow(price_wide) > 260, "Not enough data; try a longer window."))
+
+      prices <- xts::xts(as.matrix(price_wide[,-1]), order.by = price_wide$date)
+      colnames(prices) <- colnames(price_wide)[-1]
+
+      incProgress(0.25, detail="Building portfolio…")
       built <- build_port(prices, input$rebal, input$mode, 60, 252, weights0)
       r_xts <- built$r_xts
       validate(need(NROW(r_xts) > 0, "No returns computed; check your inputs."))
       r <- as.numeric(r_xts)
       last_w <- if (is.null(built$last_w)) (rep(1/NCOL(prices), NCOL(prices))) else built$last_w
-      
-      incProgress(0.2, detail="Computing risk metrics…")
+
+      incProgress(0.25, detail="Computing risk metrics…")
       VaR_hist  <- hist_VaR(r, input$conf)
       VaR_param <- param_VaR(r, input$conf)
       VaR_mc    <- mc_VaR(r, n=10000, conf=input$conf)
@@ -443,7 +522,7 @@ server <- function(input, output, session) {
       )
       
       plots <- make_plots(r_xts, input$conf)
-      
+
       maxdd_val <- suppressWarnings(PerformanceAnalytics::maxDrawdown(r_xts))
       stats <- data.frame(
         Metric = c("Start","End","Obs","CAGR","AnnVol","Sharpe","MaxDD","WorstDay","BestDay","Rebal","Weights"),
@@ -461,15 +540,41 @@ server <- function(input, output, session) {
         stringsAsFactors = FALSE
       )
       rownames(stats) <- stats$Metric
-      
-      list(prices=prices, r_xts=r_xts, risk_tbl=risk_tbl, stats=stats, plots=plots, last_w=last_w)
+
+      incProgress(0.2, detail="Assembling signals…")
+      signal_table <- build_signal_table(colnames(prices), input$dates[1], input$dates[2])
+      signals_latest <- if (nrow(signal_table)) {
+        signal_table %>%
+          group_by(symbol) %>%
+          filter(date == max(date, na.rm = TRUE)) %>%
+          slice_tail(n = 1) %>%
+          ungroup()
+      } else {
+        tibble()
+      }
+
+      list(prices=prices, r_xts=r_xts, risk_tbl=risk_tbl, stats=stats, plots=plots, last_w=last_w,
+           signal_table = signal_table, signals_latest = signals_latest)
     })
   }, ignoreInit = TRUE)
   
   # Tables
   output$risk_tbl <- renderDT({ req(results()); datatable(results()$risk_tbl, rownames=FALSE, options=list(pageLength=5)) })
   output$stats_tbl <- renderDT({ req(results()); datatable(results()$stats, rownames=FALSE, options=list(dom='t')) })
-  
+  output$signals_tbl <- renderDT({
+    req(results())
+    sig <- results()$signals_latest
+    validate(need(nrow(sig) > 0, "No signal data available for the selected window."))
+    macro_cols <- intersect(colnames(sig), c("DGS10", "DTWEXM"))
+    display_cols <- intersect(c("symbol", "date", "adjusted", "log_return", "momentum_252d",
+                                "volatility_60d", "pe_ratio", "eps", "peg_ratio", "news_sentiment",
+                                "market_cap", macro_cols), colnames(sig))
+    sig %>%
+      mutate(date = as.character(date)) %>%
+      select(all_of(display_cols)) %>%
+      datatable(rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE))
+  })
+
   # Plots
   output$p_hist <- renderPlot({ req(results()); results()$plots$p_hist })
   output$p_roll <- renderPlot({ req(results()); results()$plots$p_roll })
